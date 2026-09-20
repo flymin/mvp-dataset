@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
@@ -33,9 +32,21 @@ class _WorkerState:
 
     worker_id: int
     state: dict[str, object]
+    snapshot_id: int
 
     def pin_memory(self) -> _WorkerState:
         """Return a copy whose user payload is pinned in memory."""
+        return self
+
+
+@dataclass(slots=True)
+class _WorkerPaused:
+    """Complete a prefetch task without advancing a frozen worker's data cursor."""
+
+    worker_id: int
+
+    def pin_memory(self) -> _WorkerPaused:
+        """Return the control message without allocating pinned payloads."""
         return self
 
 
@@ -58,7 +69,7 @@ class _ResumeTrackingDataset(TorchIterableDataset):
         self,
         dataset: Iterable[object],
         worker_states: dict[str, dict[str, object]],
-        snapshot_event: object,
+        snapshot_request: object,
         batch_size: int | None,
         drop_last: bool,
         collate_fn: Callable[[list[object]], object] | None,
@@ -66,12 +77,12 @@ class _ResumeTrackingDataset(TorchIterableDataset):
         """Initialize the object."""
         self.dataset = dataset
         self.worker_states = worker_states
-        self.snapshot_event = snapshot_event
+        self.snapshot_request = snapshot_request
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.collate_fn = collate_fn
 
-    def __iter__(self) -> Iterator[_WorkerItem | _WorkerState | _WorkerDone]:
+    def __iter__(self) -> Iterator[_WorkerItem | _WorkerState | _WorkerPaused | _WorkerDone]:
         """Return the iterator object."""
         worker_info = get_worker_info()
         worker_id = 0 if worker_info is None else int(worker_info.id)
@@ -89,14 +100,19 @@ class _ResumeTrackingDataset(TorchIterableDataset):
 
         for item in self._iter_outputs(iterator):
             yield _WorkerItem(worker_id=worker_id, item=item)
-            if self.snapshot_event.is_set():
-                if live_state is None:
-                    raise UnsupportedResume(
-                        "[UnsupportedResume] TorchLoader dataset iterator does not support live_state"
-                    )
-                yield _WorkerState(worker_id=worker_id, state=live_state())
-                while self.snapshot_event.is_set():
-                    time.sleep(0.001)
+            captured = 0
+            while snapshot_id := self.snapshot_request.value:
+                if snapshot_id != captured:
+                    if live_state is None:
+                        raise UnsupportedResume(
+                            "[UnsupportedResume] TorchLoader dataset iterator does not support live_state"
+                        )
+                    captured = snapshot_id
+                    yield _WorkerState(worker_id=worker_id, state=live_state(), snapshot_id=snapshot_id)
+                else:
+                    # Blocking here deadlocks an ordered DataLoader when this
+                    # worker's next task precedes another worker's state message.
+                    yield _WorkerPaused(worker_id=worker_id)
         yield _WorkerDone(worker_id=worker_id, state={} if live_state is None else live_state())
 
     def _iter_outputs(self, iterator: Iterator[object]) -> Iterator[object]:
