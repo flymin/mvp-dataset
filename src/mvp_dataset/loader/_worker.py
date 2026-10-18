@@ -76,7 +76,9 @@ class _ResumeTrackingDataset(TorchIterableDataset):
     ) -> None:
         """Initialize the object."""
         self.dataset = dataset
-        self.worker_states = worker_states
+        # Own the mapping so releasing a bootstrap never mutates the caller's
+        # checkpoint (including one still being serialized asynchronously).
+        self.worker_states = dict(worker_states)
         self.snapshot_request = snapshot_request
         self.batch_size = batch_size
         self.drop_last = drop_last
@@ -96,6 +98,11 @@ class _ResumeTrackingDataset(TorchIterableDataset):
             load_live_state(worker_state)
 
         iterator = iter(dataset)
+        # load_live_state may defer consumption until iter(dataset). Do not keep
+        # the consumed input graph in this suspended generator or retain states
+        # for unrelated workers in each worker process.
+        self.release_worker_states()
+        del worker_state
         live_state = getattr(iterator, "live_state", None)
 
         for item in self._iter_outputs(iterator):
@@ -114,6 +121,10 @@ class _ResumeTrackingDataset(TorchIterableDataset):
                     # worker's next task precedes another worker's state message.
                     yield _WorkerPaused(worker_id=worker_id)
         yield _WorkerDone(worker_id=worker_id, state={} if live_state is None else live_state())
+
+    def release_worker_states(self) -> None:
+        """Release this process's bootstrap references after a safe handoff."""
+        self.worker_states.clear()
 
     def _iter_outputs(self, iterator: Iterator[object]) -> Iterator[object]:
         """Yield user-visible outputs and snapshot messages for one worker."""

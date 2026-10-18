@@ -840,8 +840,21 @@ class CacheManager:
     def _remove_temporary_directories(self, entry: CacheEntry) -> None:
         if not entry.temporary_parent.is_dir():
             return
+        local_prefix = f"{socket.gethostname()}-"
         for path in entry.temporary_parent.iterdir():
-            self._remove_path(path)
+            # A shared filesystem may provide only client-local flock. Never
+            # sweep another host's or a still-running builder's staging tree.
+            if not path.name.startswith(local_prefix):
+                continue
+            owner = re.fullmatch(r"([1-9][0-9]{0,9})-[0-9a-f]{32}", path.name[len(local_prefix) :])
+            if owner is None or int(owner[1]) > 2_147_483_647:
+                continue
+            try:
+                os.kill(int(owner[1]), 0)
+            except ProcessLookupError:
+                self._remove_path(path)
+            except PermissionError:
+                continue
 
     @staticmethod
     def _remove_path(path: Path) -> None:
