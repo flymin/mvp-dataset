@@ -21,7 +21,6 @@ class _ResumeMergeIterator:
         stream: Iterable[object],
         *,
         num_workers: int,
-        worker_states: dict[str, dict[str, object]],
         next_worker: int,
         pending_outputs: dict[str, list[object]],
         snapshot_request: object,
@@ -29,7 +28,10 @@ class _ResumeMergeIterator:
         """Initialize the object."""
         self.stream = iter(stream)
         self.num_workers = num_workers
-        self.worker_states = dict(worker_states)
+        # Only exhausted workers need a persistent cursor: they cannot answer
+        # another snapshot request. Live worker snapshots belong to the caller,
+        # not to this iterator between saves (nor to its resume bootstrap).
+        self._finished_worker_states: dict[str, dict[str, object]] = {}
         self.next_worker = next_worker
         self.snapshot_request = snapshot_request
         self.snapshot_id = 0
@@ -58,11 +60,13 @@ class _ResumeMergeIterator:
             if isinstance(item, _WorkerItem):
                 self.buffers[item.worker_id].append(item.item)
             elif isinstance(item, _WorkerState):
-                self.worker_states[str(item.worker_id)] = item.state
+                # Prefetched acknowledgements from an earlier save may arrive
+                # after release. They are not needed for live training.
+                continue
             elif isinstance(item, _WorkerPaused):
                 continue
             elif isinstance(item, _WorkerDone):
-                self.worker_states[str(item.worker_id)] = item.state
+                self._finished_worker_states[str(item.worker_id)] = item.state
                 self.done.add(item.worker_id)
                 if item.worker_id == self.next_worker:
                     self.next_worker = self._advance_worker(item.worker_id)
@@ -76,6 +80,7 @@ class _ResumeMergeIterator:
         # A worker may not observe the release between two consecutive saves.
         # Distinct generations still require it to acknowledge the new request.
         self.snapshot_id += 1
+        worker_states = dict(self._finished_worker_states)
         self.snapshot_request.value = self.snapshot_id
         try:
             waiting_for = {worker_id for worker_id in range(self.num_workers) if worker_id not in self.done}
@@ -85,12 +90,13 @@ class _ResumeMergeIterator:
                     self.buffers[item.worker_id].append(item.item)
                 elif isinstance(item, _WorkerState):
                     if item.snapshot_id == self.snapshot_id:
-                        self.worker_states[str(item.worker_id)] = item.state
+                        worker_states[str(item.worker_id)] = item.state
                         waiting_for.discard(item.worker_id)
                 elif isinstance(item, _WorkerPaused):
                     continue
                 elif isinstance(item, _WorkerDone):
-                    self.worker_states[str(item.worker_id)] = item.state
+                    self._finished_worker_states[str(item.worker_id)] = item.state
+                    worker_states[str(item.worker_id)] = item.state
                     self.done.add(item.worker_id)
                     waiting_for.discard(item.worker_id)
                 else:
@@ -101,7 +107,7 @@ class _ResumeMergeIterator:
             self.snapshot_request.value = 0
         return {
             "next_worker": self.next_worker,
-            "workers": dict(self.worker_states),
+            "workers": worker_states,
             "pending_outputs": {str(worker_id): list(buffer) for worker_id, buffer in self.buffers.items() if buffer},
         }
 
@@ -136,20 +142,20 @@ class _TorchLoaderIterator:
         pending = loader._peek_pending_state()
         worker_states, next_worker, pending_outputs, stage_states = self._parse_live_state(pending)
         self.snapshot_request = loader._multiprocessing_snapshot_request()
+        tracking_dataset = _ResumeTrackingDataset(
+            loader._dataset,
+            worker_states,
+            self.snapshot_request,
+            loader._batch_size,
+            loader._drop_last,
+            loader._collate_fn,
+        )
         self.merge_stream = _ResumeMergeIterator(
             loader._build_torch_dataloader(
-                dataset=_ResumeTrackingDataset(
-                    loader._dataset,
-                    worker_states,
-                    self.snapshot_request,
-                    loader._batch_size,
-                    loader._drop_last,
-                    loader._collate_fn,
-                ),
+                dataset=tracking_dataset,
                 resume_tracking=True,
             ),
             num_workers=loader._state_worker_count(),
-            worker_states=worker_states,
             next_worker=next_worker,
             pending_outputs=pending_outputs,
             snapshot_request=self.snapshot_request,
@@ -163,6 +169,12 @@ class _TorchLoaderIterator:
         if stage_states is not None:
             self._load_stage_state(stage_states)
         self.stream = iter(stream)
+        # Multi-process DataLoader iterator construction has already handed the
+        # bootstrap to forked/spawned workers. Its parent-side dataset copy must
+        # not retain every worker's old graph. With zero workers __iter__ is lazy:
+        # the wrapper itself releases the bootstrap after restoring its dataset.
+        if loader._num_workers > 0:
+            tracking_dataset.release_worker_states()
         if pending is not None:
             self.loader._take_pending_state()
 
